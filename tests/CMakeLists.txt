@@ -1,22 +1,18 @@
 
 add_subdirectory(Catch2)
 
-set(LMQ_TEST_SRC
+add_executable(tests
     main.cpp
     test_address.cpp
     test_batch.cpp
-    test_bt.cpp
     test_connect.cpp
     test_commands.cpp
-    test_encoding.cpp
     test_failures.cpp
     test_inject.cpp
     test_requests.cpp
     test_tagged_threads.cpp
     test_timer.cpp
-    )
-
-add_executable(tests ${LMQ_TEST_SRC})
+)
 
 find_package(Threads)
 

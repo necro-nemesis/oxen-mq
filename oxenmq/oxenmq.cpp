@@ -5,13 +5,15 @@
 #include <random>
 #include <ostream>
 #include <thread>
+#include <future>
 
 extern "C" {
 #include <sodium/core.h>
 #include <sodium/crypto_box.h>
 #include <sodium/crypto_scalarmult.h>
 }
-#include "hex.h"
+#include <oxenc/hex.h>
+#include <oxenc/variant.h>
 
 namespace oxenmq {
 
@@ -20,7 +22,7 @@ namespace {
 
 /// Creates a message by bt-serializing the given value (string, number, list, or dict)
 template <typename T>
-zmq::message_t create_bt_message(T&& data) { return create_message(bt_serialize(std::forward<T>(data))); }
+zmq::message_t create_bt_message(T&& data) { return create_message(oxenc::bt_serialize(std::forward<T>(data))); }
 
 template <typename MessageContainer>
 std::vector<std::string> as_strings(const MessageContainer& msgs) {
@@ -61,9 +63,9 @@ std::pair<std::string, AuthLevel> extract_metadata(zmq::message_t& msg) {
         std::string_view pubkey_hex{msg.gets("User-Id")};
         if (pubkey_hex.size() != 64)
             throw std::logic_error("bad user-id");
-        assert(is_hex(pubkey_hex.begin(), pubkey_hex.end()));
+        assert(oxenc::is_hex(pubkey_hex.begin(), pubkey_hex.end()));
         result.first.resize(32, 0);
-        from_hex(pubkey_hex.begin(), pubkey_hex.end(), result.first.begin());
+        oxenc::from_hex(pubkey_hex.begin(), pubkey_hex.end(), result.first.begin());
     } catch (...) {}
 
     try {
@@ -199,7 +201,7 @@ OxenMQ::OxenMQ(
         sn_lookup{std::move(lookup)}, log_lvl{level}, logger{std::move(logger)}
 {
 
-    LMQ_TRACE("Constructing OxenMQ, id=", object_id, ", this=", this);
+    OMQ_TRACE("Constructing OxenMQ, id=", object_id, ", this=", this);
 
     if (sodium_init() == -1)
         throw std::runtime_error{"libsodium initialization failed"};
@@ -209,7 +211,7 @@ OxenMQ::OxenMQ(
     } else if (pubkey.empty()) {
         if (service_node)
             throw std::invalid_argument("Cannot construct a service node mode OxenMQ without a keypair");
-        LMQ_LOG(debug, "generating x25519 keypair for remote-only OxenMQ instance");
+        OMQ_LOG(debug, "generating x25519 keypair for remote-only OxenMQ instance");
         pubkey.resize(crypto_box_PUBLICKEYBYTES);
         privkey.resize(crypto_box_SECRETKEYBYTES);
         crypto_box_keypair(reinterpret_cast<unsigned char*>(&pubkey[0]), reinterpret_cast<unsigned char*>(&privkey[0]));
@@ -232,24 +234,29 @@ void OxenMQ::start() {
     if (proxy_thread.joinable())
         throw std::logic_error("Cannot call start() multiple times!");
 
-    LMQ_LOG(info, "Initializing OxenMQ ", bind.empty() ? "remote-only" : "listener", " with pubkey ", to_hex(pubkey));
+    OMQ_LOG(info, "Initializing OxenMQ ", bind.empty() ? "remote-only" : "listener", " with pubkey ", oxenc::to_hex(pubkey));
 
     int zmq_socket_limit = context.get(zmq::ctxopt::socket_limit);
     if (MAX_SOCKETS > 1 && MAX_SOCKETS <= zmq_socket_limit)
         context.set(zmq::ctxopt::max_sockets, MAX_SOCKETS);
     else
-        LMQ_LOG(error, "Not applying OxenMQ::MAX_SOCKETS setting: ", MAX_SOCKETS, " must be in [1, ", zmq_socket_limit, "]");
+        OMQ_LOG(error, "Not applying OxenMQ::MAX_SOCKETS setting: ", MAX_SOCKETS, " must be in [1, ", zmq_socket_limit, "]");
 
     // We bind `command` here so that the `get_control_socket()` below is always connecting to a
     // bound socket, but we do nothing else here: the proxy thread is responsible for everything
     // except binding it.
     command.bind(SN_ADDR_COMMAND);
-    proxy_thread = std::thread{&OxenMQ::proxy_loop, this};
+    std::promise<void> startup_prom;
+    auto proxy_startup = startup_prom.get_future();
+    proxy_thread = std::thread{&OxenMQ::proxy_loop, this, std::move(startup_prom)};
 
-    LMQ_LOG(debug, "Waiting for proxy thread to get ready...");
+    OMQ_LOG(debug, "Waiting for proxy thread to initialize...");
+    proxy_startup.get(); // Rethrows exceptions from the proxy startup (e.g. failure to bind)
+
+    OMQ_LOG(debug, "Waiting for proxy thread to get ready...");
     auto &control = get_control_socket();
     detail::send_control(control, "START");
-    LMQ_TRACE("Sent START command");
+    OMQ_TRACE("Sent START command");
 
     zmq::message_t ready_msg;
     std::vector<zmq::message_t> parts;
@@ -258,7 +265,7 @@ void OxenMQ::start() {
 
     if (!(parts.size() == 1 && view(parts.front()) == "READY"))
         throw std::runtime_error("Invalid startup message from proxy thread (didn't get expected READY message)");
-    LMQ_LOG(debug, "Proxy thread is ready");
+    OMQ_LOG(debug, "Proxy thread is ready");
 }
 
 void OxenMQ::listen_curve(std::string bind_addr, AllowFunc allow_connection, std::function<void(bool)> on_bind) {
@@ -267,7 +274,7 @@ void OxenMQ::listen_curve(std::string bind_addr, AllowFunc allow_connection, std
     if (!allow_connection) allow_connection = [](auto&&...) { return AuthLevel::none; };
     bind_data d{std::move(bind_addr), true, std::move(allow_connection), std::move(on_bind)};
     if (proxy_thread.joinable())
-        detail::send_control(get_control_socket(), "BIND", bt_serialize(detail::serialize_object(std::move(d))));
+        detail::send_control(get_control_socket(), "BIND", oxenc::bt_serialize(detail::serialize_object(std::move(d))));
     else
         bind.push_back(std::move(d));
 }
@@ -278,7 +285,7 @@ void OxenMQ::listen_plain(std::string bind_addr, AllowFunc allow_connection, std
     if (!allow_connection) allow_connection = [](auto&&...) { return AuthLevel::none; };
     bind_data d{std::move(bind_addr), false, std::move(allow_connection), std::move(on_bind)};
     if (proxy_thread.joinable())
-        detail::send_control(get_control_socket(), "BIND", bt_serialize(detail::serialize_object(std::move(d))));
+        detail::send_control(get_control_socket(), "BIND", oxenc::bt_serialize(detail::serialize_object(std::move(d))));
     else
         bind.push_back(std::move(d));
 }
@@ -286,7 +293,7 @@ void OxenMQ::listen_plain(std::string bind_addr, AllowFunc allow_connection, std
 
 std::pair<OxenMQ::category*, const std::pair<OxenMQ::CommandCallback, bool>*> OxenMQ::get_command(std::string& command) {
     if (command.size() > MAX_CATEGORY_LENGTH + 1 + MAX_COMMAND_LENGTH) {
-        LMQ_LOG(warn, "Invalid command '", command, "': command too long");
+        OMQ_LOG(warn, "Invalid command '", command, "': command too long");
         return {};
     }
 
@@ -298,7 +305,7 @@ std::pair<OxenMQ::category*, const std::pair<OxenMQ::CommandCallback, bool>*> Ox
 
     auto dot = command.find('.');
     if (dot == 0 || dot == std::string::npos) {
-        LMQ_LOG(warn, "Invalid command '", command, "': expected <category>.<command>");
+        OMQ_LOG(warn, "Invalid command '", command, "': expected <category>.<command>");
         return {};
     }
     std::string catname = command.substr(0, dot);
@@ -306,14 +313,14 @@ std::pair<OxenMQ::category*, const std::pair<OxenMQ::CommandCallback, bool>*> Ox
 
     auto catit = categories.find(catname);
     if (catit == categories.end()) {
-        LMQ_LOG(warn, "Invalid command category '", catname, "'");
+        OMQ_LOG(warn, "Invalid command category '", catname, "'");
         return {};
     }
 
     const auto& category = catit->second;
     auto callback_it = category.commands.find(cmd);
     if (callback_it == category.commands.end()) {
-        LMQ_LOG(warn, "Invalid command '", command, "'");
+        OMQ_LOG(warn, "Invalid command '", command, "'");
         return {};
     }
 
@@ -416,10 +423,10 @@ OxenMQ::~OxenMQ() {
         return;
     }
 
-    LMQ_LOG(info, "OxenMQ shutting down proxy thread");
+    OMQ_LOG(info, "OxenMQ shutting down proxy thread");
     detail::send_control(get_control_socket(), "QUIT");
     proxy_thread.join();
-    LMQ_LOG(info, "OxenMQ proxy thread has stopped");
+    OMQ_LOG(info, "OxenMQ proxy thread has stopped");
 }
 
 std::ostream &operator<<(std::ostream &os, LogLevel lvl) {

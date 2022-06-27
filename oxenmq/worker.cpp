@@ -8,6 +8,7 @@ extern "C" {
 #include <pthread_np.h>
 }
 #endif
+#include <oxenc/variant.h>
 
 namespace oxenmq {
 
@@ -17,29 +18,29 @@ namespace {
 // received.  If "QUIT" was received, replies with "QUITTING" on the socket and closes it, then
 // returns false.
 [[gnu::always_inline]] inline
-bool worker_wait_for(OxenMQ& lmq, zmq::socket_t& sock, std::vector<zmq::message_t>& parts, const std::string_view worker_id, const std::string_view expect) {
+bool worker_wait_for(OxenMQ& omq, zmq::socket_t& sock, std::vector<zmq::message_t>& parts, const std::string_view worker_id, const std::string_view expect) {
     while (true) {
-        lmq.log(LogLevel::trace, __FILE__, __LINE__, "worker ", worker_id, " waiting for ", expect);
+        omq.log(LogLevel::trace, __FILE__, __LINE__, "worker ", worker_id, " waiting for ", expect);
         parts.clear();
         recv_message_parts(sock, parts);
         if (parts.size() != 1) {
-            lmq.log(LogLevel::error, __FILE__, __LINE__, "Internal error: worker ", worker_id, " received invalid ", parts.size(), "-part control msg");
+            omq.log(LogLevel::error, __FILE__, __LINE__, "Internal error: worker ", worker_id, " received invalid ", parts.size(), "-part control msg");
             continue;
         }
         auto command = view(parts[0]);
         if (command == expect) {
 #ifndef NDEBUG
-            lmq.log(LogLevel::trace, __FILE__, __LINE__, "Worker ", worker_id, " received waited-for ", expect, " command");
+            omq.log(LogLevel::trace, __FILE__, __LINE__, "Worker ", worker_id, " received waited-for ", expect, " command");
 #endif
             return true;
         } else if (command == "QUIT"sv) {
-            lmq.log(LogLevel::debug, __FILE__, __LINE__, "Worker ", worker_id, " received QUIT command, shutting down");
+            omq.log(LogLevel::debug, __FILE__, __LINE__, "Worker ", worker_id, " received QUIT command, shutting down");
             detail::send_control(sock, "QUITTING");
             sock.set(zmq::sockopt::linger, 1000);
             sock.close();
             return false;
         } else {
-            lmq.log(LogLevel::error, __FILE__, __LINE__, "Internal error: worker ", worker_id, " received invalid command: `", command, "'");
+            omq.log(LogLevel::error, __FILE__, __LINE__, "Internal error: worker ", worker_id, " received invalid command: `", command, "'");
         }
     }
 }
@@ -47,10 +48,11 @@ bool worker_wait_for(OxenMQ& lmq, zmq::socket_t& sock, std::vector<zmq::message_
 }
 
 void OxenMQ::worker_thread(unsigned int index, std::optional<std::string> tagged, std::function<void()> start) {
-    std::string routing_id = (tagged ? "t" : "w") + std::to_string(index); // for routing
-    std::string_view worker_id{tagged ? *tagged : routing_id};              // for debug
+    std::string routing_id = (tagged ? "t" : "w") +
+        std::string(reinterpret_cast<const char*>(&index), sizeof(index)); // for routing
+    std::string worker_id{tagged ? *tagged : "w" + std::to_string(index)}; // for debug
 
-    [[maybe_unused]] std::string thread_name = tagged.value_or("lmq-" + routing_id);
+    [[maybe_unused]] std::string thread_name = tagged.value_or("omq-" + worker_id);
 #if defined(__linux__) || defined(__sun) || defined(__MINGW32__)
     if (thread_name.size() > 15) thread_name.resize(15);
     pthread_setname_np(pthread_self(), thread_name.c_str());
@@ -62,7 +64,7 @@ void OxenMQ::worker_thread(unsigned int index, std::optional<std::string> tagged
 
     zmq::socket_t sock{context, zmq::socket_type::dealer};
     sock.set(zmq::sockopt::routing_id, routing_id);
-    LMQ_LOG(debug, "New worker thread ", worker_id, " (", routing_id, ") started");
+    OMQ_LOG(debug, "New worker thread ", worker_id, " (", routing_id, ") started");
     sock.connect(SN_ADDR_WORKERS);
     if (tagged)
         detail::send_control(sock, "STARTING");
@@ -101,15 +103,15 @@ void OxenMQ::worker_thread(unsigned int index, std::optional<std::string> tagged
             if (run.is_batch_job) {
                 auto* batch = var::get<detail::Batch*>(run.to_run);
                 if (run.batch_jobno >= 0) {
-                    LMQ_TRACE("worker thread ", worker_id, " running batch ", batch, "#", run.batch_jobno);
+                    OMQ_TRACE("worker thread ", worker_id, " running batch ", batch, "#", run.batch_jobno);
                     batch->run_job(run.batch_jobno);
                 } else if (run.batch_jobno == -1) {
-                    LMQ_TRACE("worker thread ", worker_id, " running batch ", batch, " completion");
+                    OMQ_TRACE("worker thread ", worker_id, " running batch ", batch, " completion");
                     batch->job_completion();
                 }
             } else if (run.is_injected) {
                 auto& func = var::get<std::function<void()>>(run.to_run);
-                LMQ_TRACE("worker thread ", worker_id, " invoking injected command ", run.command);
+                OMQ_TRACE("worker thread ", worker_id, " invoking injected command ", run.command);
                 func();
                 func = nullptr;
             } else {
@@ -118,7 +120,7 @@ void OxenMQ::worker_thread(unsigned int index, std::optional<std::string> tagged
                 message.remote = std::move(run.remote);
                 message.data.clear();
 
-                LMQ_TRACE("Got incoming command from ", message.remote, "/", message.conn, message.conn.route.empty() ? " (outgoing)" : " (incoming)");
+                OMQ_TRACE("Got incoming command from ", message.remote, "/", message.conn, message.conn.route.empty() ? " (outgoing)" : " (incoming)");
 
                 auto& [callback, is_request] = *var::get<const std::pair<CommandCallback, bool>*>(run.to_run);
                 if (is_request) {
@@ -130,26 +132,26 @@ void OxenMQ::worker_thread(unsigned int index, std::optional<std::string> tagged
                         message.data.emplace_back(m.data<char>(), m.size());
                 }
 
-                LMQ_TRACE("worker thread ", worker_id, " invoking ", run.command, " callback with ", message.data.size(), " message parts");
+                OMQ_TRACE("worker thread ", worker_id, " invoking ", run.command, " callback with ", message.data.size(), " message parts");
                 callback(message);
             }
         }
-        catch (const bt_deserialize_invalid& e) {
-            LMQ_LOG(warn, worker_id, " deserialization failed: ", e.what(), "; ignoring request");
+        catch (const oxenc::bt_deserialize_invalid& e) {
+            OMQ_LOG(warn, worker_id, " deserialization failed: ", e.what(), "; ignoring request");
         }
 #ifndef BROKEN_APPLE_VARIANT
         catch (const std::bad_variant_access& e) {
-            LMQ_LOG(warn, worker_id, " deserialization failed: found unexpected serialized type (", e.what(), "); ignoring request");
+            OMQ_LOG(warn, worker_id, " deserialization failed: found unexpected serialized type (", e.what(), "); ignoring request");
         }
 #endif
         catch (const std::out_of_range& e) {
-            LMQ_LOG(warn, worker_id, " deserialization failed: invalid data - required field missing (", e.what(), "); ignoring request");
+            OMQ_LOG(warn, worker_id, " deserialization failed: invalid data - required field missing (", e.what(), "); ignoring request");
         }
         catch (const std::exception& e) {
-            LMQ_LOG(warn, worker_id, " caught exception when processing command: ", e.what());
+            OMQ_LOG(warn, worker_id, " caught exception when processing command: ", e.what());
         }
         catch (...) {
-            LMQ_LOG(warn, worker_id, " caught non-standard exception when processing command");
+            OMQ_LOG(warn, worker_id, " caught non-standard exception when processing command");
         }
 
         // Tell the proxy thread that we are ready for another job
@@ -160,47 +162,45 @@ void OxenMQ::worker_thread(unsigned int index, std::optional<std::string> tagged
 
 
 OxenMQ::run_info& OxenMQ::get_idle_worker() {
-    if (idle_workers.empty()) {
-        size_t id = workers.size();
-        assert(workers.capacity() > id);
+    if (idle_worker_count == 0) {
+        uint32_t id = workers.size();
         workers.emplace_back();
         auto& r = workers.back();
         r.worker_id = id;
-        r.worker_routing_id = "w" + std::to_string(id);
+        r.worker_routing_id = "w" + std::string(reinterpret_cast<const char*>(&id), sizeof(id));
+        r.worker_routing_name = "w" + std::to_string(id);
         return r;
     }
-    size_t id = idle_workers.back();
-    idle_workers.pop_back();
+    size_t id = idle_workers[--idle_worker_count];
     return workers[id];
 }
 
-void OxenMQ::proxy_worker_message(std::vector<zmq::message_t>& parts) {
+void OxenMQ::proxy_worker_message(OxenMQ::control_message_array& parts, size_t len) {
     // Process messages sent by workers
-    if (parts.size() != 2) {
-        LMQ_LOG(error, "Received send invalid ", parts.size(), "-part message");
+    if (len != 2) {
+        OMQ_LOG(error, "Received send invalid ", len, "-part message");
         return;
     }
     auto route = view(parts[0]), cmd = view(parts[1]);
-    LMQ_TRACE("worker message from ", route);
-    assert(route.size() >= 2 && (route[0] == 'w' || route[0] == 't') && route[1] >= '0' && route[1] <= '9');
+    if (route.size() != 5 || (route[0] != 'w' && route[0] != 't')) {
+        OMQ_LOG(error, "Received malformed worker id in worker message; unable to process worker command");
+        return;
+    }
     bool tagged_worker = route[0] == 't';
-    std::string_view worker_id_str{&route[1], route.size()-1}; // Chop off the leading "w" (or "t")
-    unsigned int worker_id = detail::extract_unsigned(worker_id_str);
-    if (!worker_id_str.empty() /* didn't consume everything */ ||
-            (tagged_worker
-                ? 0 == worker_id || worker_id > tagged_workers.size() // tagged worker ids are indexed from 1 to N (0 means untagged)
-                : worker_id >= workers.size() // regular worker ids are indexed from 0 to N-1
-            )
-    ) {
-        LMQ_LOG(error, "Worker id '", route, "' is invalid, unable to process worker command");
+    uint32_t worker_id;
+    std::memcpy(&worker_id, route.data() + 1, 4);
+    if (tagged_worker
+            ? 0 == worker_id || worker_id > tagged_workers.size() // tagged worker ids are indexed from 1 to N (0 means untagged)
+            : worker_id >= workers.size()) { // regular worker ids are indexed from 0 to N-1
+        OMQ_LOG(error, "Received invalid worker id w" + std::to_string(worker_id) + " in worker message; unable to process worker command");
         return;
     }
 
     auto& run = tagged_worker ? std::get<run_info>(tagged_workers[worker_id - 1]) : workers[worker_id];
 
-    LMQ_TRACE("received ", cmd, " command from ", route);
+    OMQ_TRACE("received ", cmd, " command from ", route);
     if (cmd == "RAN"sv) {
-        LMQ_TRACE("Worker ", route, " finished ", run.is_batch_job ? "batch job" : run.command);
+        OMQ_TRACE("Worker ", route, " finished ", run.is_batch_job ? "batch job" : run.command);
         if (run.is_batch_job) {
             if (tagged_worker) {
                 std::get<bool>(tagged_workers[worker_id - 1]) = false;
@@ -218,25 +218,25 @@ void OxenMQ::proxy_worker_message(std::vector<zmq::message_t>& parts) {
                 auto [state, thread] = batch->job_finished();
                 if (state == detail::BatchState::complete) {
                     if (thread == -1) { // run directly in proxy
-                        LMQ_TRACE("Completion job running directly in proxy");
+                        OMQ_TRACE("Completion job running directly in proxy");
                         try {
                             batch->job_completion(); // RUN DIRECTLY IN PROXY THREAD
                         } catch (const std::exception &e) {
                             // Raise these to error levels: the caller really shouldn't be doing
                             // anything non-trivial in an in-proxy completion function!
-                            LMQ_LOG(error, "proxy thread caught exception when processing in-proxy completion command: ", e.what());
+                            OMQ_LOG(error, "proxy thread caught exception when processing in-proxy completion command: ", e.what());
                         } catch (...) {
-                            LMQ_LOG(error, "proxy thread caught non-standard exception when processing in-proxy completion command");
+                            OMQ_LOG(error, "proxy thread caught non-standard exception when processing in-proxy completion command");
                         }
                         clear_job = true;
                     } else {
                         auto& jobs =
                             thread > 0
-                            ? std::get<std::queue<batch_job>>(tagged_workers[thread - 1]) // run in tagged thread
+                            ? std::get<batch_queue>(tagged_workers[thread - 1]) // run in tagged thread
                             : run.is_reply_job
                               ? reply_jobs
                               : batch_jobs;
-                        jobs.emplace(batch, -1);
+                        jobs.emplace_back(batch, -1);
                     }
                 } else if (state == detail::BatchState::done) {
                     // No completion job
@@ -246,25 +246,23 @@ void OxenMQ::proxy_worker_message(std::vector<zmq::message_t>& parts) {
             }
 
             if (clear_job) {
-                batches.erase(batch);
                 delete batch;
-                run.to_run = static_cast<detail::Batch*>(nullptr);
             }
         } else {
             assert(run.cat->active_threads > 0);
             run.cat->active_threads--;
         }
         if (max_workers == 0) { // Shutting down
-            LMQ_TRACE("Telling worker ", route, " to quit");
+            OMQ_TRACE("Telling worker ", route, " to quit");
             route_control(workers_socket, route, "QUIT");
         } else if (!tagged_worker) {
-            idle_workers.push_back(worker_id);
+            idle_workers[idle_worker_count++] = worker_id;
         }
     } else if (cmd == "QUITTING"sv) {
         run.worker_thread.join();
-        LMQ_LOG(debug, "Worker ", route, " exited normally");
+        OMQ_LOG(debug, "Worker ", route, " exited normally");
     } else {
-        LMQ_LOG(error, "Worker ", route, " sent unknown control message: `", cmd, "'");
+        OMQ_LOG(error, "Worker ", route, " sent unknown control message: `", cmd, "'");
     }
 }
 
@@ -289,7 +287,7 @@ void OxenMQ::proxy_to_worker(int64_t conn_id, zmq::socket_t& sock, std::vector<z
             : peers.find(conn_id);
 
         if (it == peers.end()) {
-            LMQ_LOG(warn, "Internal error: connection id ", conn_id, " not found");
+            OMQ_LOG(warn, "Internal error: connection id ", conn_id, " not found");
             return;
         }
         peer = &it->second;
@@ -348,12 +346,12 @@ void OxenMQ::proxy_to_worker(int64_t conn_id, zmq::socket_t& sock, std::vector<z
     if (category.active_threads >= category.reserved_threads && active_workers() >= general_workers) {
         // No free reserved or general spots, try to queue it for later
         if (category.max_queue >= 0 && category.queued >= category.max_queue) {
-            LMQ_LOG(warn, "No space to queue incoming command ", command, "; already have ", category.queued,
+            OMQ_LOG(warn, "No space to queue incoming command ", command, "; already have ", category.queued,
                     "commands queued in that category (max ", category.max_queue, "); dropping message");
             return;
         }
 
-        LMQ_LOG(debug, "No available free workers, queuing ", command, " for later");
+        OMQ_LOG(debug, "No available free workers, queuing ", command, " for later");
         ConnectionID conn{peer->service_node ? ConnectionID::SN_ID : conn_id, peer->pubkey, std::move(tmp_peer.route)};
         pending_commands.emplace_back(category, std::move(command), std::move(data_parts), cat_call.second,
                 std::move(conn), std::move(access), peer_address(parts[command_part_index]));
@@ -362,7 +360,7 @@ void OxenMQ::proxy_to_worker(int64_t conn_id, zmq::socket_t& sock, std::vector<z
     }
 
     if (cat_call.second->second /*is_request*/ && data_parts.empty()) {
-        LMQ_LOG(warn, "Received an invalid request command with no reply tag; dropping message");
+        OMQ_LOG(warn, "Received an invalid request command with no reply tag; dropping message");
         return;
     }
 
@@ -379,8 +377,8 @@ void OxenMQ::proxy_to_worker(int64_t conn_id, zmq::socket_t& sock, std::vector<z
     if (outgoing)
         peer->activity(); // outgoing connection activity, pump the activity timer
 
-    LMQ_TRACE("Forwarding incoming ", run.command, " from ", run.conn, " @ ", peer_address(parts[command_part_index]),
-            " to worker ", run.worker_routing_id);
+    OMQ_TRACE("Forwarding incoming ", run.command, " from ", run.conn, " @ ", peer_address(parts[command_part_index]),
+            " to worker ", run.worker_routing_name);
 
     proxy_run_worker(run);
     category.active_threads++;
@@ -391,7 +389,7 @@ void OxenMQ::inject_task(const std::string& category, std::string command, std::
     auto it = categories.find(category);
     if (it == categories.end())
         throw std::out_of_range{"Invalid category `" + category + "': category does not exist"};
-    detail::send_control(get_control_socket(), "INJECT", bt_serialize(detail::serialize_object(
+    detail::send_control(get_control_socket(), "INJECT", oxenc::bt_serialize(detail::serialize_object(
                 injected_task{it->second, std::move(command), std::move(remote), std::move(callback)})));
 }
 
@@ -400,18 +398,18 @@ void OxenMQ::proxy_inject_task(injected_task task) {
     if (category.active_threads >= category.reserved_threads && active_workers() >= general_workers) {
         // No free worker slot, queue for later
         if (category.max_queue >= 0 && category.queued >= category.max_queue) {
-            LMQ_LOG(warn, "No space to queue injected task ", task.command, "; already have ", category.queued,
+            OMQ_LOG(warn, "No space to queue injected task ", task.command, "; already have ", category.queued,
                     "commands queued in that category (max ", category.max_queue, "); dropping task");
             return;
         }
-        LMQ_LOG(debug, "No available free workers for injected task ", task.command, "; queuing for later");
+        OMQ_LOG(debug, "No available free workers for injected task ", task.command, "; queuing for later");
         pending_commands.emplace_back(category, std::move(task.command), std::move(task.callback), std::move(task.remote));
         category.queued++;
         return;
     }
 
     auto& run = get_idle_worker();
-    LMQ_TRACE("Forwarding incoming injected task ", task.command, " from ", task.remote, " to worker ", run.worker_routing_id);
+    OMQ_TRACE("Forwarding incoming injected task ", task.command, " from ", task.remote, " to worker ", run.worker_routing_name);
     run.load(&category, std::move(task.command), std::move(task.remote), std::move(task.callback));
 
     proxy_run_worker(run);

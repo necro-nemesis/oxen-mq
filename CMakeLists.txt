@@ -17,7 +17,7 @@ cmake_minimum_required(VERSION 3.7)
 set(CMAKE_OSX_DEPLOYMENT_TARGET 10.12 CACHE STRING "macOS deployment target (Apple clang only)")
 
 project(liboxenmq
-    VERSION 1.2.8
+    VERSION 1.2.12
     LANGUAGES CXX C)
 
 include(GNUInstallDirs)
@@ -56,7 +56,6 @@ endif()
 add_library(oxenmq
     oxenmq/address.cpp
     oxenmq/auth.cpp
-    oxenmq/bt_serialize.cpp
     oxenmq/connections.cpp
     oxenmq/jobs.cpp
     oxenmq/oxenmq.cpp
@@ -68,6 +67,30 @@ set_target_properties(oxenmq PROPERTIES SOVERSION ${OXENMQ_LIBVERSION})
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 target_link_libraries(oxenmq PRIVATE Threads::Threads)
+
+
+if(TARGET oxenc::oxenc)
+    add_library(_oxenmq_external_oxenc INTERFACE IMPORTED)
+    target_link_libraries(_oxenmq_external_oxenc INTERFACE oxenc::oxenc)
+    target_link_libraries(oxenmq PUBLIC _oxenmq_external_oxenc)
+    message(STATUS "using pre-existing oxenc::oxenc target")
+elseif(BUILD_SHARED_LIBS)
+    include(FindPkgConfig)
+    pkg_check_modules(oxenc liboxenc IMPORTED_TARGET)
+
+    if(oxenc_FOUND)
+        # Work around cmake bug 22180 (PkgConfig::tgt not set if no flags needed)
+        if(TARGET PkgConfig::oxenc OR CMAKE_VERSION VERSION_GREATER_EQUAL "3.21")
+            target_link_libraries(oxenmq PUBLIC PkgConfig::oxenc)
+        endif()
+    else()
+        add_subdirectory(oxen-encoding)
+        target_link_libraries(oxenmq PUBLIC oxenc::oxenc)
+    endif()
+else()
+    add_subdirectory(oxen-encoding)
+    target_link_libraries(oxenmq PUBLIC oxenc::oxenc)
+endif()
 
 # libzmq is nearly impossible to link statically from a system-installed static library: it depends
 # on a ton of other libraries, some of which are not all statically available.  If the caller wants
@@ -120,8 +143,12 @@ if(WARNINGS_AS_ERRORS)
     target_compile_options(oxenmq PRIVATE -Werror)
 endif()
 
-target_compile_features(oxenmq PUBLIC cxx_std_17)
-set_target_properties(oxenmq PROPERTIES POSITION_INDEPENDENT_CODE ON)
+set_target_properties(oxenmq PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
 
 function(link_dep_libs target linktype libdirs)
     foreach(lib ${ARGN})
@@ -184,7 +211,6 @@ if(OXENMQ_INSTALL)
         oxenmq/batch.h
         oxenmq/bt_serialize.h
         oxenmq/bt_value.h
-        oxenmq/byte_type.h
         oxenmq/connections.h
         oxenmq/hex.h
         oxenmq/oxenmq.h

@@ -2,15 +2,15 @@
 #include "oxenmq.h"
 
 // Inside some method:
-//     LMQ_LOG(warn, "bad ", 42, " stuff");
+//     OMQ_LOG(warn, "bad ", 42, " stuff");
 //
-#define LMQ_LOG(level, ...) log(LogLevel::level, __FILE__, __LINE__, __VA_ARGS__)
+#define OMQ_LOG(level, ...) log(LogLevel::level, __FILE__, __LINE__, __VA_ARGS__)
 
 #ifndef NDEBUG
-// Same as LMQ_LOG(trace, ...) when not doing a release build; nothing under a release build.
-#  define LMQ_TRACE(...) log(LogLevel::trace, __FILE__, __LINE__, __VA_ARGS__)
+// Same as OMQ_LOG(trace, ...) when not doing a release build; nothing under a release build.
+#  define OMQ_TRACE(...) log(LogLevel::trace, __FILE__, __LINE__, __VA_ARGS__)
 #else
-#  define LMQ_TRACE(...)
+#  define OMQ_TRACE(...)
 #endif
 
 namespace oxenmq {
@@ -86,6 +86,21 @@ inline bool recv_message_parts(zmq::socket_t& sock, std::vector<zmq::message_t>&
     return true;
 }
 
+// Same as above, but using a fixed sized array; this is only used for internal jobs (e.g. control
+// messages) where we know the message parts should never exceed a given size (this function does
+// not bounds check except in debug builds).  Returns the number of message parts received, or 0 on
+// read error.
+template <size_t N>
+inline size_t recv_message_parts(zmq::socket_t& sock, std::array<zmq::message_t, N>& parts, const zmq::recv_flags flags = zmq::recv_flags::none) {
+    for (size_t count = 0; ; count++) {
+        assert(count < N);
+        if (!sock.recv(parts[count], flags))
+            return 0;
+        if (!parts[count].more())
+            return count + 1;
+    }
+}
+
 inline const char* peer_address(zmq::message_t& msg) {
     try { return msg.gets("Peer-Address"); } catch (...) {}
     return "(unknown)";
@@ -115,7 +130,7 @@ inline AuthLevel auth_from_string(std::string_view a) {
 }
 
 // Extracts and builds the "send" part of a message for proxy_send/proxy_reply
-inline std::list<zmq::message_t> build_send_parts(bt_list_consumer send, std::string_view route) {
+inline std::list<zmq::message_t> build_send_parts(oxenc::bt_list_consumer send, std::string_view route) {
     std::list<zmq::message_t> parts;
     if (!route.empty())
         parts.push_back(create_message(route));
